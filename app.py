@@ -1,133 +1,107 @@
-from flask import Flask, render_template, request, redirect, url_for, flash
-import sqlite3
-import string
-import random
-from datetime import datetime
+import os
+import shortuuid
+import qrcode
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory, flash
+from werkzeug.utils import secure_filename
+from PIL import Image
+from io import BytesIO
+import base64
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key_here'
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+app.config['QRCODE_FOLDER'] = 'static/qrcodes'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
-# Database initialization
-def init_db():
-    conn = sqlite3.connect('url_shortener.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS urls
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  long_url TEXT NOT NULL,
-                  short_code TEXT UNIQUE NOT NULL,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  clicks INTEGER DEFAULT 0)''')
-    conn.commit()
-    conn.close()
+# Create directories if they don't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['QRCODE_FOLDER'], exist_ok=True)
 
-# Generate short code
-def generate_short_code(length=6):
-    chars = string.ascii_letters + string.digits
-    return ''.join(random.choice(chars) for _ in range(length))
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
-# Check if short code exists
-def short_code_exists(short_code):
-    conn = sqlite3.connect('url_shortener.db')
-    c = conn.cursor()
-    c.execute("SELECT id FROM urls WHERE short_code = ?", (short_code,))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
-
-# Get total links and clicks
-def get_stats():
-    conn = sqlite3.connect('url_shortener.db')
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*), SUM(clicks) FROM urls")
-    result = c.fetchone()
-    conn.close()
-    return result[0] or 0, result[1] or 0
+def generate_short_id():
+    return shortuuid.uuid()[:8]
 
 @app.route('/')
 def index():
-    total_links, total_clicks = get_stats()
-    return render_template('index.html', total_links=total_links, total_clicks=total_clicks)
+    return render_template('index''.html')
 
-@app.route('/shorten', methods=['POST'])
-def shorten_url():
-    long_url = request.form.get('long_url')
-    custom_code = request.form.get('custom_code')
+@app.route('/upload', methods=['POST'])
+def upload_files():
+    if 'files' not in request.files:
+        flash('No files selected')
+        return redirect(request.url)
     
-    if not long_url:
-        flash('Please enter a URL', 'error')
+    files = request.files.getlist('files')
+    
+    if len(files) == 0 or files[0].filename == '':
+        flash('No files selected')
         return redirect(url_for('index'))
     
-    # Add https:// if missing
-    if not long_url.startswith(('http://', 'https://')):
-        long_url = 'https://' + long_url
+    results = []
     
-    # Check if custom code is provided and valid
-    if custom_code:
-        if short_code_exists(custom_code):
-            flash('Custom name already exists. Please choose another one.', 'error')
-            return redirect(url_for('index'))
-        short_code = custom_code
-    else:
-        # Generate a unique short code
-        short_code = generate_short_code()
-        while short_code_exists(short_code):
-            short_code = generate_short_code()
+    for file in files:
+        if file and allowed_file(file.filename):
+            # Generate unique filename
+            short_id = generate_short_id()
+            filename = secure_filename(file.filename)
+            file_extension = filename.rsplit('.', 1)[1].lower()
+            new_filename = f"{short_id}.{file_extension}"
+            
+            # Save the file
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], new_filename)
+            file.save(file_path)
+            
+            # Generate URLs
+            base_url = request.host_url
+            short_link = f"{base_url}i/{short_id}"
+            long_link = f"{base_url}static/uploads/{new_filename}"
+            
+            # Generate QR code
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(short_link)
+            qr.make(fit=True)
+            
+            qr_img = qr.make_image(fill_color="black", back_color="white")
+            qr_filename = f"{short_id}.png"
+            qr_path = os.path.join(app.config['QRCODE_FOLDER'], qr_filename)
+            qr_img.save(qr_path)
+            
+            # Convert QR code to base64 for inline display
+            buffered = BytesIO()
+            qr_img.save(buffered, format="PNG")
+            qr_base64 = base64.b64encode(buffered.getvalue()).decode()
+            
+            results.append({
+                'original_name': filename,
+                'short_id': short_id,
+                'short_link': short_link,
+                'long_link': long_link,
+                'qr_code': f"data:image/png;base64,{qr_base64}",
+                'file_url': url_for('static', filename=f'uploads/{new_filename}')
+            })
+        else:
+            flash(f'File {file.filename} is not an allowed image type')
     
-    # Save to database
-    conn = sqlite3.connect('url_shortener.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO urls (long_url, short_code) VALUES (?, ?)", 
-              (long_url, short_code))
-    conn.commit()
-    conn.close()
-    
-    short_url = request.host_url + short_code
-    flash('URL shortened successfully!', 'success')
-    total_links, total_clicks = get_stats()
-    return render_template('index.html', short_url=short_url, long_url=long_url, 
-                           total_links=total_links, total_clicks=total_clicks)
+    return render_template('index.html', results=results)
 
-@app.route('/<short_code>')
-def redirect_to_url(short_code):
-    conn = sqlite3.connect('url_shortener.db')
-    c = conn.cursor()
-    c.execute("SELECT long_url FROM urls WHERE short_code = ?", (short_code,))
-    result = c.fetchone()
+@app.route('/i/<short_id>')
+def get_image(short_id):
+    # Look for the file with the given short_id
+    upload_dir = app.config['UPLOAD_FOLDER']
+    for filename in os.listdir(upload_dir):
+        if filename.startswith(short_id):
+            return send_from_directory(upload_dir, filename)
     
-    if result:
-        long_url = result[0]
-        # Update click count
-        c.execute("UPDATE urls SET clicks = clicks + 1 WHERE short_code = ?", (short_code,))
-        conn.commit()
-        conn.close()
-        return redirect(long_url)
-    else:
-        conn.close()
-        flash('URL not found', 'error')
-        return redirect(url_for('index'))
-
-@app.route('/history')
-def history():
-    conn = sqlite3.connect('url_shortener.db')
-    c = conn.cursor()
-    c.execute("SELECT * FROM urls ORDER BY created_at DESC")
-    urls = c.fetchall()
-    conn.close()
-    
-    # Format the data for the template
-    url_list = []
-    for url in urls:
-        url_list.append({
-            'id': url[0],
-            'long_url': url[1],
-            'short_code': url[2],
-            'created_at': url[3],
-            'clicks': url[4],
-            'short_url': request.host_url + url[2]
-        })
-    
-    return render_template('history.html', urls=url_list)
+    return "Image not found", 404
 
 if __name__ == '__main__':
-    init_db()
     app.run(debug=True)
